@@ -78,7 +78,11 @@ Triggers on: `rm -rf`, `git reset --hard`, `git push --force`, `drop table`, etc
 Also triggers on the Windows equivalents: `Remove-Item -Recurse -Force` (and
 its aliases `ri`, `rd`, `del`, `erase`, `rmdir`, including abbreviated flags
 like `-Rec -Fo`), cmd.exe `rd /s` and `del /f /s /q`, and the same commands
-wrapped in `powershell`/`pwsh -Command`/`-EncodedCommand` or `cmd /c`.
+wrapped in `powershell`/`pwsh -Command`/`-EncodedCommand` or `cmd /c`. Windows
+detection tokenizes using PowerShell's own quoting rules (backtick escapes,
+doubled-single-quote escapes, here-strings) rather than bash's, so a Windows
+path ending in a backslash right before a closing quote parses correctly
+instead of being misread as an escaped quote.
 
 ```
 1. List all files/data this command will modify or delete

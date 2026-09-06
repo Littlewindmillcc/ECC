@@ -439,6 +439,153 @@ function isDestructiveQuoteAware(raw, depth = 0) {
 }
 
 /**
+ * Blank the bodies of PowerShell here-strings (`@"..."@` and `@'...'@`) so
+ * their content can't be mistaken for command tokens or destructive flags,
+ * mirroring stripHeredocBodies for POSIX `<<EOF` blocks. A here-string's
+ * closing marker must start a line, so the regex requires a newline on
+ * both sides of the body.
+ *
+ * @param {string} input
+ * @returns {string}
+ */
+function stripPowerShellHereStrings(input) {
+  return String(input || '').replace(/@(["'])\r?\n([\s\S]*?)\r?\n\1@/g, (match, quote) => `@${quote}\n${'\n'.repeat((match.match(/\n/g) || []).length - 2)}\n${quote}@`);
+}
+
+/**
+ * Quote-aware segment splitter using PowerShell's own quoting/escaping
+ * rules instead of bash's. Unlike bash, backslash has NO escaping role
+ * anywhere in a PowerShell string: a doubled quote char (`''`) escapes to
+ * a literal quote inside `'...'`, and a backtick escapes the next
+ * character (including `` `" ``) inside `"..."`. This is the
+ * PowerShell-syntax counterpart to quoteAwareSegments, needed because that
+ * function's universal backslash-escape handling misparses a Windows path
+ * ending in a backslash right before a closing quote, merging everything
+ * after it (including destructive flags like `-Recurse`/`-Force`) into one
+ * unterminated-looking token.
+ *
+ * @param {string} input
+ * @returns {string[][]}
+ */
+function powerShellQuoteAwareSegments(input) {
+  const segments = [];
+  let words = [];
+  let current = '';
+  let hasWord = false;
+  let quote = null; // "'" or '"' or null
+
+  const flushWord = () => {
+    if (hasWord) words.push(current);
+    current = '';
+    hasWord = false;
+  };
+  const flushSegment = () => {
+    flushWord();
+    if (words.length) segments.push(words);
+    words = [];
+  };
+
+  const chars = Array.from(String(input || ''));
+  for (let i = 0; i < chars.length; i += 1) {
+    const ch = chars[i];
+    if (quote === "'") {
+      if (ch === "'") {
+        if (chars[i + 1] === "'") {
+          current += "'";
+          hasWord = true;
+          i += 1; // consume the doubled quote as one literal quote
+          continue;
+        }
+        quote = null;
+        continue;
+      }
+      current += ch;
+      hasWord = true;
+      continue;
+    }
+    if (quote === '"') {
+      if (ch === '`') {
+        current += chars[i + 1] || '';
+        hasWord = true;
+        i += 1;
+        continue;
+      }
+      if (ch === '"') {
+        quote = null;
+        continue;
+      }
+      current += ch;
+      hasWord = true;
+      continue;
+    }
+    if (ch === "'" || ch === '"') {
+      quote = ch;
+      hasWord = true;
+      continue;
+    }
+    if (SHELL_SEGMENT_SEPARATORS.has(ch)) {
+      flushSegment();
+      continue;
+    }
+    if (/\s/.test(ch)) {
+      flushWord();
+      continue;
+    }
+    current += ch;
+    hasWord = true;
+  }
+  flushSegment();
+  return segments;
+}
+
+/**
+ * PowerShell-syntax-aware destructive check (ECC-039 phase 2): mirrors
+ * isDestructiveQuoteAware but tokenizes using PowerShell's own
+ * quoting/escaping rules so a command that only parses correctly under
+ * those rules — e.g. a Windows path ending in a backslash right before a
+ * closing quote — isn't missed by the bash-oriented pass above. Here-string
+ * bodies are blanked first so their content can't be mistaken for command
+ * tokens. Run unconditionally alongside the POSIX/bash-oriented checks,
+ * regardless of host OS: a false positive here only costs an extra
+ * fact-force prompt, the same cost the existing POSIX checks already
+ * accept.
+ *
+ * @param {string} raw
+ * @param {number} [depth] recursion guard for wrapper payloads
+ * @returns {boolean}
+ */
+function isDestructivePowerShellAware(raw, depth = 0) {
+  if (depth > 4) return false;
+  const withoutHereStrings = stripPowerShellHereStrings(raw);
+  for (const tokens of powerShellQuoteAwareSegments(withoutHereStrings)) {
+    if (tokens.length === 0) continue;
+    if (isDestructiveRemoveItem(tokens)) return true;
+    if (isDestructiveCmdDelete(tokens)) return true;
+    if (isDestructiveGit(tokens)) return true;
+    const base = commandBasename(tokens[0]);
+    if (WINDOWS_SHELL_WRAPPERS.has(base)) {
+      if (base === 'cmd') {
+        const ci = tokens.findIndex(t => t.toLowerCase() === '/c');
+        if (ci !== -1 && tokens.length > ci + 1) {
+          const payload = tokens.slice(ci + 1).join(' ');
+          if (payload && isDestructivePowerShellAware(payload, depth + 1)) return true;
+        }
+      } else {
+        const flag = findPowerShellCommandFlag(tokens);
+        if (flag && flag.encoded) {
+          const decoded = decodePowerShellEncodedCommand(tokens[flag.index + 1]);
+          if (decoded && isDestructivePowerShellAware(decoded, depth + 1)) return true;
+        } else if (flag) {
+          const payload = tokens.slice(flag.index + 1).join(' ');
+          if (payload && isDestructivePowerShellAware(payload, depth + 1)) return true;
+        }
+      }
+    }
+  }
+  return false;
+}
+
+/**
  * Strip a leading path and trailing `.exe` from a command token so
  * `/usr/bin/git`, `git.exe`, and `GIT` all normalize to `git`.
  *
@@ -846,6 +993,13 @@ function isDestructiveBash(command) {
   // quoted-find-exec, sh/bash -c, and powershell/pwsh/cmd wrapper bypasses
   // (GHSA-4v57-ph3x-gf55 for the POSIX side; ECC-039 for the Windows side).
   if (isDestructiveQuoteAware(executable)) return true;
+
+  // PowerShell-syntax-aware pass (ECC-039 phase 2): catches commands that
+  // only tokenize correctly under PowerShell's own quoting rules (backtick
+  // escape, doubled-single-quote escape, here-strings) rather than bash's —
+  // notably a Windows path ending in a backslash right before a closing
+  // quote, which the pass above misparses as an escaped quote.
+  if (isDestructivePowerShellAware(executable)) return true;
 
   return false;
 }
