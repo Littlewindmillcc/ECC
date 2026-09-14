@@ -2860,6 +2860,146 @@ function runTests() {
     passed++;
   else failed++;
 
+  // --- ECC-039: PowerShell / cmd.exe destructive-command coverage ---
+
+  if (
+    test('denies Remove-Item -Recurse -Force as destructive', () => {
+      expectDestructiveDeny('Remove-Item -Recurse -Force C:\\important', 'Remove-Item -Recurse -Force');
+    })
+  )
+    passed++;
+  else failed++;
+
+  if (
+    test('denies Remove-Item with abbreviated -Rec -Fo flags', () => {
+      expectDestructiveDeny('Remove-Item -Rec -Fo C:\\important', 'Remove-Item -Rec -Fo');
+    })
+  )
+    passed++;
+  else failed++;
+
+  if (
+    test('denies the ri alias for Remove-Item -Recurse -Force', () => {
+      expectDestructiveDeny('ri -Recurse -Force C:\\important', 'ri -Recurse -Force');
+    })
+  )
+    passed++;
+  else failed++;
+
+  if (
+    test('allows Remove-Item -Force without -Recurse (single-file delete parity with rm -f)', () => {
+      expectAllow('Remove-Item -Force C:\\important\\file.txt', 'Remove-Item -Force only');
+    })
+  )
+    passed++;
+  else failed++;
+
+  if (
+    test('allows bare Remove-Item with no flags', () => {
+      expectAllow('Remove-Item C:\\important', 'Remove-Item bare');
+    })
+  )
+    passed++;
+  else failed++;
+
+  if (
+    test('denies rd /s /q as destructive (cmd.exe recursive directory delete)', () => {
+      expectDestructiveDeny('rd /s /q C:\\important', 'rd /s /q');
+    })
+  )
+    passed++;
+  else failed++;
+
+  if (
+    test('allows bare rd with no /s flag', () => {
+      expectAllow('rd C:\\important', 'rd bare');
+    })
+  )
+    passed++;
+  else failed++;
+
+  if (
+    test('denies del /f /s /q as destructive (cmd.exe forced recursive delete)', () => {
+      expectDestructiveDeny('del /f /s /q C:\\important\\*', 'del /f /s /q');
+    })
+  )
+    passed++;
+  else failed++;
+
+  if (
+    test('allows del /f without /s (single-file force delete parity with rm -f)', () => {
+      expectAllow('del /f C:\\important\\file.txt', 'del /f only');
+    })
+  )
+    passed++;
+  else failed++;
+
+  if (
+    test('denies powershell -Command wrapping a destructive Remove-Item', () => {
+      expectDestructiveDeny('powershell -Command "Remove-Item -Recurse -Force C:\\important"', 'powershell -Command Remove-Item');
+    })
+  )
+    passed++;
+  else failed++;
+
+  if (
+    test('denies powershell.exe with a flag before -Command still recursing into the payload', () => {
+      expectDestructiveDeny('powershell.exe -NoProfile -Command "Remove-Item -Recurse -Force C:\\important"', 'powershell.exe -NoProfile -Command');
+    })
+  )
+    passed++;
+  else failed++;
+
+  if (
+    test('denies pwsh -c with an unquoted multi-token destructive payload', () => {
+      expectDestructiveDeny('pwsh -c Remove-Item -Recurse -Force C:\\important', 'pwsh -c (unquoted)');
+    })
+  )
+    passed++;
+  else failed++;
+
+  if (
+    test('denies cmd /c wrapping a destructive del', () => {
+      expectDestructiveDeny('cmd /c del /f /s /q C:\\important', 'cmd /c del');
+    })
+  )
+    passed++;
+  else failed++;
+
+  if (
+    test('denies cmd.exe /C (uppercase flag) wrapping a destructive rd', () => {
+      expectDestructiveDeny('cmd.exe /C "rd /s /q C:\\important"', 'cmd.exe /C rd');
+    })
+  )
+    passed++;
+  else failed++;
+
+  if (
+    test('allows powershell -Command wrapping a non-destructive payload', () => {
+      expectAllow('powershell -Command "Get-ChildItem C:\\important"', 'powershell -Command Get-ChildItem');
+    })
+  )
+    passed++;
+  else failed++;
+
+  if (
+    test('denies powershell -EncodedCommand base64 payload decoding to a destructive Remove-Item', () => {
+      const encoded = Buffer.from('Remove-Item -Recurse -Force C:\\important', 'utf16le').toString('base64');
+      expectDestructiveDeny(`powershell -EncodedCommand ${encoded}`, 'powershell -EncodedCommand');
+    })
+  )
+    passed++;
+  else failed++;
+
+  if (
+    test('allows powershell -EncodedCommand base64 payload decoding to a non-destructive command', () => {
+      const encoded = Buffer.from('Get-ChildItem C:\\important', 'utf16le').toString('base64');
+      expectAllow(`powershell -EncodedCommand ${encoded}`, 'powershell -EncodedCommand (safe)');
+    })
+  )
+    passed++;
+  else failed++;
+
   // Cleanup only the temp directory created by this test file.
   try {
     if (fs.existsSync(stateDir)) {

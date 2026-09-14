@@ -337,11 +337,64 @@ function quoteAwareSegments(input) {
 }
 
 const SHELL_WRAPPERS = new Set(['sh', 'bash', 'zsh', 'dash', 'ksh']);
+const WINDOWS_SHELL_WRAPPERS = new Set(['powershell', 'pwsh', 'cmd']);
+
+/**
+ * Locate PowerShell's `-Command` (or an unambiguous abbreviation such as
+ * `-c`/`-com`) or `-EncodedCommand` (`-e`/`-enc`/...) flag within a
+ * powershell/pwsh invocation's tokens. An explicit `-Command`-shaped match
+ * always wins over an `-EncodedCommand`-shaped one: a short abbreviation
+ * like `-e` is ambiguous with real PowerShell flags such as
+ * `-ExecutionPolicy`, so treating every `-e*` token as `-EncodedCommand`
+ * risks stopping the scan on a red herring and missing a real `-Command`
+ * later in the same invocation.
+ *
+ * @param {string[]} tokens
+ * @returns {{ index: number, encoded: boolean } | null}
+ */
+function findPowerShellCommandFlag(tokens) {
+  let encodedFallback = null;
+  for (let i = 1; i < tokens.length; i += 1) {
+    const t = tokens[i];
+    if (!t.startsWith('-')) continue;
+    const body = t.slice(1).toLowerCase();
+    if (!body) continue;
+    if ('command'.startsWith(body)) return { index: i, encoded: false };
+    if (encodedFallback === null && 'encodedcommand'.startsWith(body)) {
+      encodedFallback = i;
+    }
+  }
+  return encodedFallback === null ? null : { index: encodedFallback, encoded: true };
+}
+
+/**
+ * Decode a PowerShell `-EncodedCommand` payload (base64 of UTF-16LE text).
+ * Returns null rather than throwing on malformed input, and rejects a
+ * base64 round-trip mismatch so a short unrelated token (e.g. an
+ * `-ExecutionPolicy` value misread as `-EncodedCommand` by the abbreviation
+ * fallback above) isn't decoded into misleading noise.
+ *
+ * @param {string} token
+ * @returns {string | null}
+ */
+function decodePowerShellEncodedCommand(token) {
+  if (!token) return null;
+  try {
+    const buf = Buffer.from(token, 'base64');
+    if (buf.length === 0) return null;
+    if (buf.toString('base64').replace(/=+$/, '') !== token.replace(/=+$/, '')) return null;
+    return buf.toString('utf16le');
+  } catch (_) {
+    return null;
+  }
+}
 
 /**
  * Quote-aware destructive check: catches quoted command words, newline
- * separators, quoted `find -exec`, and `sh -c`/`bash -c` wrappers that evade
- * the quote-stripping path (GHSA-4v57-ph3x-gf55).
+ * separators, quoted `find -exec`, `sh -c`/`bash -c` wrappers, and
+ * `powershell`/`pwsh -Command`/`-EncodedCommand` and `cmd /c` wrappers that
+ * evade the quote-stripping path (GHSA-4v57-ph3x-gf55 for the POSIX side;
+ * ECC-039 for the Windows side).
  *
  * @param {string} raw
  * @param {number} [depth] recursion guard for shell -c wrappers
@@ -353,12 +406,32 @@ function isDestructiveQuoteAware(raw, depth = 0) {
     if (tokens.length === 0) continue;
     if (isDestructiveRm(tokens)) return true;
     if (isDestructiveGit(tokens)) return true;
+    if (isDestructiveRemoveItem(tokens)) return true;
+    if (isDestructiveCmdDelete(tokens)) return true;
     if (isDestructiveFindExec(tokens.join(' '))) return true;
     const base = commandBasename(tokens[0]);
     if (SHELL_WRAPPERS.has(base)) {
       const ci = tokens.indexOf('-c');
       if (ci !== -1 && tokens[ci + 1] && isDestructiveQuoteAware(tokens[ci + 1], depth + 1)) {
         return true;
+      }
+    }
+    if (WINDOWS_SHELL_WRAPPERS.has(base)) {
+      if (base === 'cmd') {
+        const ci = tokens.findIndex(t => t.toLowerCase() === '/c');
+        if (ci !== -1 && tokens.length > ci + 1) {
+          const payload = tokens.slice(ci + 1).join(' ');
+          if (payload && isDestructiveQuoteAware(payload, depth + 1)) return true;
+        }
+      } else {
+        const flag = findPowerShellCommandFlag(tokens);
+        if (flag && flag.encoded) {
+          const decoded = decodePowerShellEncodedCommand(tokens[flag.index + 1]);
+          if (decoded && isDestructiveQuoteAware(decoded, depth + 1)) return true;
+        } else if (flag) {
+          const payload = tokens.slice(flag.index + 1).join(' ');
+          if (payload && isDestructiveQuoteAware(payload, depth + 1)) return true;
+        }
       }
     }
   }
@@ -545,6 +618,60 @@ function isDestructiveGit(tokens) {
   return false;
 }
 
+const REMOVE_ITEM_BASENAMES = new Set(['remove-item', 'ri', 'rd', 'del', 'erase', 'rmdir']);
+
+/**
+ * Detect PowerShell `Remove-Item` (and its built-in aliases `ri`, `rd`,
+ * `del`, `erase`, `rmdir`) invocations that recursively force-delete.
+ * PowerShell parameters are case-insensitive and can be abbreviated to any
+ * unambiguous prefix (`-Recurse` -> `-Rec`/`-R`, `-Force` -> `-Fo`/`-F`), so
+ * flags are matched by case-insensitive prefix against the full parameter
+ * name rather than exact spelling. Requires BOTH recurse AND force, mirroring
+ * isDestructiveRm's `-r`+`-f` requirement, so a bare `-Force` (single-file
+ * delete) stays as non-destructive as a bare `rm -f`.
+ *
+ * @param {string[]} tokens
+ * @returns {boolean}
+ */
+function isDestructiveRemoveItem(tokens) {
+  if (tokens.length === 0 || !REMOVE_ITEM_BASENAMES.has(commandBasename(tokens[0]))) return false;
+  let hasRecurse = false;
+  let hasForce = false;
+  for (const t of tokens.slice(1)) {
+    if (!t.startsWith('-') || t.startsWith('--')) continue;
+    const body = t.slice(1).toLowerCase();
+    if (!body) continue;
+    if ('recurse'.startsWith(body)) hasRecurse = true;
+    if ('force'.startsWith(body)) hasForce = true;
+  }
+  return hasRecurse && hasForce;
+}
+
+/**
+ * Detect cmd.exe destructive deletes: `rd`/`rmdir /s` (recursive directory
+ * removal) and `del`/`erase` combined with `/f` (force) and `/s` (recursive)
+ * — the combo used to non-interactively wipe a directory tree
+ * (`del /f /s /q ...`). `rd`/`rmdir` has no separate force flag, so `/s`
+ * alone (the flag that turns a single-directory removal into a whole-tree
+ * delete) is sufficient; `del`/`erase` requires both `/f` and `/s`, mirroring
+ * isDestructiveRm's recurse+force pairing.
+ *
+ * @param {string[]} tokens
+ * @returns {boolean}
+ */
+function isDestructiveCmdDelete(tokens) {
+  if (tokens.length === 0) return false;
+  const base = commandBasename(tokens[0]);
+  const flags = new Set(tokens.slice(1).map(t => t.toLowerCase()));
+  if (base === 'rd' || base === 'rmdir') {
+    return flags.has('/s');
+  }
+  if (base === 'del' || base === 'erase') {
+    return flags.has('/f') && flags.has('/s');
+  }
+  return false;
+}
+
 /**
  * Decide whether a bash command line contains a destructive action
  * the fact-forcing gate should challenge. Combines SQL-keyword
@@ -711,10 +838,13 @@ function isDestructiveBash(command) {
     const tokens = tokenize(segment);
     if (isDestructiveRm(tokens)) return true;
     if (isDestructiveGit(tokens)) return true;
+    if (isDestructiveRemoveItem(tokens)) return true;
+    if (isDestructiveCmdDelete(tokens)) return true;
   }
 
   // Quote-aware pass: closes the quoted-command-word, newline-separator,
-  // quoted-find-exec, and sh/bash -c bypasses (GHSA-4v57-ph3x-gf55).
+  // quoted-find-exec, sh/bash -c, and powershell/pwsh/cmd wrapper bypasses
+  // (GHSA-4v57-ph3x-gf55 for the POSIX side; ECC-039 for the Windows side).
   if (isDestructiveQuoteAware(executable)) return true;
 
   return false;
