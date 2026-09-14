@@ -3000,6 +3000,72 @@ function runTests() {
     passed++;
   else failed++;
 
+  // --- ECC-039 phase 2: PowerShell-syntax-aware tokenizer robustness ---
+  //
+  // A Windows path ending in a backslash right before a closing quote
+  // (e.g. 'C:\Important Data\') is valid, unescaped PowerShell — bash
+  // escaping rules misread that trailing `\'` as an escaped quote, merging
+  // everything after it (including -Recurse/-Force) into one unterminated
+  // token. At the top level this was masked by the naive whitespace
+  // tokenizer fallback, but inside a powershell -Command wrapper payload
+  // only the (buggy) quote-aware recursive path saw it, producing a real
+  // false negative. These tests pin that fix.
+
+  if (
+    test('denies Remove-Item with a trailing-backslash path nested inside powershell -Command (ECC-039 phase 2 false negative)', () => {
+      expectDestructiveDeny(
+        'powershell -Command "Remove-Item \'C:\\Important Data\\\' -Recurse -Force"',
+        'nested powershell -Command, trailing backslash before closing quote'
+      );
+    })
+  )
+    passed++;
+  else failed++;
+
+  if (
+    test('denies Remove-Item with a trailing-backslash path at top level (regression: naive tokenizer fallback)', () => {
+      expectDestructiveDeny(
+        'Remove-Item \'C:\\Important Data\\\' -Recurse -Force',
+        'top-level, trailing backslash before closing quote'
+      );
+    })
+  )
+    passed++;
+  else failed++;
+
+  if (
+    test('allows a doubled-single-quote-escaped payload nested inside powershell -Command (no false positive)', () => {
+      expectAllow(
+        "powershell -Command \"Write-Output 'it''s here'\"",
+        'nested powershell -Command, doubled single-quote escape'
+      );
+    })
+  )
+    passed++;
+  else failed++;
+
+  if (
+    test('allows a backtick-escaped-quote payload nested inside powershell -Command (no false positive)', () => {
+      expectAllow(
+        'powershell -Command "Write-Output `"quoted`""',
+        'nested powershell -Command, backtick-escaped quote'
+      );
+    })
+  )
+    passed++;
+  else failed++;
+
+  if (
+    test('allows a destructive-looking phrase inside a here-string body (inert string content, not executed)', () => {
+      expectAllow(
+        ['$msg = @"', 'Remove-Item -Recurse -Force C:\\Anything', '"@', 'Write-Output $msg'].join('\n'),
+        'here-string body containing destructive-looking text'
+      );
+    })
+  )
+    passed++;
+  else failed++;
+
   // Cleanup only the temp directory created by this test file.
   try {
     if (fs.existsSync(stateDir)) {
